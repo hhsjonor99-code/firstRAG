@@ -42,7 +42,19 @@ class DocumentChunk(BaseModel):
     content: str = Field(..., description="片段文本内容")
     source_name: str = Field(..., description="原始文件名（仅用于展示）")
     page_number: Optional[int] = Field(None, description="PDF 页码；其他类型可为 None")
-    paragraph_number: Optional[int] = Field(None, description="DOCX 段落编号")
+    paragraph_number: Optional[int] = Field(
+        None,
+        description="DOCX 起始段落编号（兼容旧模型；新代码请同时读 paragraph_start）",
+    )
+    paragraph_start: Optional[int] = Field(
+        None, description="DOCX 起始段落编号；与 paragraph_number 等价"
+    )
+    paragraph_end: Optional[int] = Field(
+        None, description="DOCX 结束段落编号（聚合多段时填）"
+    )
+    paragraph_numbers: list[int] = Field(
+        default_factory=list, description="聚合的所有段落编号（DOCX）"
+    )
     heading: Optional[str] = Field(None, description="标题（DOCX / MD）")
     line_start: Optional[int] = Field(None, description="起始行号（MD / TXT）")
     line_end: Optional[int] = Field(None, description="结束行号（MD / TXT）")
