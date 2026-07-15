@@ -1,0 +1,8 @@
+# 可选 API 依赖 —— 第二阶段启用 FastAPI 时安装
+# 安装示例：python -m pip install -r requirements.txt -r requirements-api.txt
+#
+# 注意：第一版仅使用 Streamlit 单体应用，不要预先安装本文件中的依赖。
+
+fastapi
+uvicorn[standard]
+python-multipart

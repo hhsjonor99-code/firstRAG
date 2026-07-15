@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.cache
+
+# 编辑器与 IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code 会话级本地配置（不属于项目代码）
+.claude/
+
+# 环境与密钥（重要）
+.env
+.env.local
+.env.*.local
+
+# 项目运行时数据
+storage/uploads/*
+!storage/uploads/.gitkeep
+storage/indexes/*
+!storage/indexes/.gitkeep
+storage/metadata/*
+!storage/metadata/.gitkeep
+
+# 临时文件（原子保存过程中的残留）
+*.tmp
+
+# 日志
+*.log
+logs/

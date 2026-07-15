@@ -1,0 +1,18 @@
+# firstRAG 运行时核心依赖（第一版必需）
+# 安装示例：python -m pip install -r requirements.txt
+# 国内网络环境可在 README 中查看可选镜像提示。
+
+streamlit
+pypdf
+python-docx
+markdown
+beautifulsoup4
+numpy
+faiss-cpu
+langchain-text-splitters
+openai
+requests
+tenacity
+python-dotenv
+pydantic
+pydantic-settings
