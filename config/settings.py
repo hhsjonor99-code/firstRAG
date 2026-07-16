@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     chunk_size: int = 800
     chunk_overlap: int = 120
     retrieval_top_k: int = 5
+    # 检索最低分数阈值；None 表示不过滤（不同 Embedding 模型分数分布不同）
+    retrieval_min_score: Optional[float] = None
 
     # ----- 上传 / 会话 -----
     max_upload_mb: int = 20
