@@ -45,19 +45,35 @@ class TextEncodingError(DocumentParseError):
 # ======================================================================
 # 解析结果结构
 # ======================================================================
+# DOCX 块类型常量
+BLOCK_TYPE_PARAGRAPH = "paragraph"
+BLOCK_TYPE_TABLE = "table"
+BLOCK_TYPE_TEXTBOX = "textbox"
+
+
 @dataclass
 class RawDocumentSection:
-    """解析后的语义单元（一页 / 一个段落 / 一个行号范围等）。
+    """解析后的语义单元。
 
-    Attributes:
+    公共字段：
         content: 文本内容（已经过基本清理）。
         source_name: 原始文件名（仅用于展示，不会用作磁盘文件名）。
         page_number: PDF 页码（从 1 开始），其他类型为 None。
-        paragraph_number: DOCX 段落编号（从 1 开始），其他类型为 None。
+        paragraph_number: DOCX 段落编号（从 1 开始，paragraph 块专用），其他类型为 None。
         heading: 当前 section 所属最近标题（DOCX / Markdown）。
         line_start: 行号范围起点（Markdown / TXT），从 1 开始。
         line_end: 行号范围终点（Markdown / TXT）。
         metadata: 额外元数据字典。
+
+    DOCX 扩展字段（不影响其他格式）：
+        block_type: ``paragraph`` / ``table`` / ``textbox``，DOCX 块类型；其他格式为 None。
+        block_index: 块在文档中的全局顺序（DOCX 专用，从 0 开始；包含 paragraph/table/textbox）。
+        table_index: 块在文档中的表格序号（DOCX 专用，table 块专用，从 0 开始）。
+        row_start: 表格行范围起点（DOCX table 专用，从 0 开始）。
+        row_end: 表格行范围终点（DOCX table 专用，从 0 开始；行合并时取首行）。
+        column_names: 表头列名列表（DOCX table 专用；无可靠表头时为 None）。
+        paragraph_start: 段落块包含的原始段落号起点（DOCX paragraph 专用）。
+        paragraph_end: 段落块包含的原始段落号终点（DOCX paragraph 专用）。
     """
 
     content: str
@@ -68,6 +84,15 @@ class RawDocumentSection:
     line_start: Optional[int] = None
     line_end: Optional[int] = None
     metadata: dict = field(default_factory=dict)
+    # ---- DOCX 扩展字段（向后兼容：默认 None）----
+    block_type: Optional[str] = None
+    block_index: Optional[int] = None
+    table_index: Optional[int] = None
+    row_start: Optional[int] = None
+    row_end: Optional[int] = None
+    column_names: Optional[list[str]] = None
+    paragraph_start: Optional[int] = None
+    paragraph_end: Optional[int] = None
 
 
 # ======================================================================
@@ -138,7 +163,11 @@ _HEADING_PATTERN_RE = re.compile(
 
 
 class DocxParser(DocumentParser):
-    """基于 python-docx 的 DOCX 解析器。
+    """基于 python-docx 的 DOCX 解析器（阶段 2.2 增强版）。
+
+    **遍历策略**：按 ``document.xml`` 中 ``body`` 的直接子节点顺序遍历，
+    保留 paragraph / table / textbox 三类块的原始文档顺序。
+    **不再使用** ``doc.paragraphs + doc.tables`` 简单拼接（会丢失块顺序）。
 
     **两层标题识别策略**：
 
@@ -151,6 +180,19 @@ class DocxParser(DocumentParser):
        - 整段加粗（≥ 80% runs 加粗）
        - 匹配 :data:`_HEADING_PATTERN_RE`（"第一章"/"一、"/"1." 等常见模式）
 
+    **表格解析**：
+    - 检测表头（首行）：首行非空、单格 ≤ 30 字符、不含终止标点。
+    - 每行构造为一条结构化 section，格式 ``列名: 值; 列名: 值``。
+    - 无可靠表头时使用 ``第N列: 值``。
+    - 处理合并单元格：``vMerge=continue`` 取上方文本；
+      ``gridSpan`` 由 python-docx 自动展开，再用 ``_tc`` 句柄去重。
+    - 整行为空时过滤。
+    - 表格继承之前最近识别出的标题。
+    - 不同表格之间不直接合并。
+
+    **过滤统计**：每次 ``parse`` 结束后通过 :attr:`last_filter_stats`
+    可查看每条规则过滤了多少块、多少字符，便于排查过度过滤问题。
+
     普通段落继承最近出现的有效标题。
     保留 paragraph_number（DOCX 段落顺序，从 1 开始）。
     对 OCR 噪声进行基本清理（合并空白、合并连续换行）。
@@ -162,50 +204,262 @@ class DocxParser(DocumentParser):
     _MAX_HEADING_LEN = 30         # 候选标题最大长度
     _BOLD_RATIO_THRESHOLD = 0.8   # 整段加粗比例
     _SIZE_DELTA_PT = 2.0          # 字号差（候选 ≥ avg + 此值）
+    # 表头识别阈值
+    _MAX_HEADER_CELL_LEN = 30     # 表头单格最大字符数
+    _MIN_TABLE_ROWS_FOR_HEADER = 2  # 至少 2 行才尝试识别表头
+
+    def __init__(self) -> None:
+        self.last_filter_stats: dict = {}
 
     def parse(self, path: Path) -> list[RawDocumentSection]:
         from docx import Document
-        from docx.enum.text import WD_ALIGN_PARAGRAPH
 
         doc = Document(str(path))
-        # 1. 先扫描所有段落，计算正文平均字号（排除明显异常的极端值）
         avg_body_size = self._compute_average_body_size(doc)
-        # 2. 第二轮扫描：识别标题并构造 sections
+
         sections: list[RawDocumentSection] = []
         current_heading: Optional[str] = None
-        paragraph_number = 0
 
-        for para in doc.paragraphs:
-            paragraph_number += 1
-            raw_text = para.text or ""
-            cleaned = _clean_text(raw_text)
-            style_name = (para.style.name or "") if para.style is not None else ""
+        # 过滤统计
+        stats = {
+            "blank_dropped": 0,
+            "blank_chars": 0,
+            "table_empty_row_dropped": 0,
+            "table_empty_row_chars": 0,
+            "textbox_empty_dropped": 0,
+        }
 
-            is_heading_text, heading_text = self._detect_heading(
-                para, cleaned, style_name, avg_body_size
-            )
-            if is_heading_text:
-                current_heading = heading_text
-                continue  # 标题自身不作为独立 section
+        # 按 body 直接子节点顺序遍历；doc.paragraphs / doc.tables 与 body
+        # 直接子节点中的 w:p / w:tbl 一一对应，索引同步递增即可。
+        body_children = list(doc.element.body)
+        para_index = 0  # doc.paragraphs 顺序索引
+        tbl_index = 0  # doc.tables 顺序索引
 
-            if not cleaned:
-                continue
+        block_index = -1
+        table_index = -1
 
-            sections.append(
-                RawDocumentSection(
-                    content=cleaned,
-                    source_name=path.name,
-                    paragraph_number=paragraph_number,
-                    heading=current_heading,
-                    metadata={"style": style_name} if style_name else {},
+        for child in body_children:
+            tag = child.tag
+            if tag.endswith("}p"):
+                # 顶层段落
+                if para_index >= len(doc.paragraphs):
+                    continue
+                para = doc.paragraphs[para_index]
+                para_index += 1
+
+                # 段落号：与 doc.paragraphs 列表位置一致（1-based）。
+                # para_index 已经反映了"截至当前位置已出现的顶层段落数"。
+                paragraph_number = para_index
+                raw_text = para.text or ""
+                cleaned = _clean_text(raw_text)
+                style_name = (para.style.name or "") if para.style is not None else ""
+
+                # 过滤 1：纯空白段落（不删除纯空白，但记录）
+                if not cleaned:
+                    stats["blank_dropped"] += 1
+                    stats["blank_chars"] += len(raw_text)
+                    continue
+
+                is_heading_text, heading_text = self._detect_heading(
+                    para, cleaned, style_name, avg_body_size
                 )
-            )
+                if is_heading_text:
+                    current_heading = heading_text
+                    continue  # 标题自身不作为独立 section
 
+                block_index += 1
+                sections.append(
+                    RawDocumentSection(
+                        content=cleaned,
+                        source_name=path.name,
+                        paragraph_number=paragraph_number,
+                        heading=current_heading,
+                        metadata={"style": style_name} if style_name else {},
+                        block_type=BLOCK_TYPE_PARAGRAPH,
+                        block_index=block_index,
+                        paragraph_start=paragraph_number,
+                        paragraph_end=paragraph_number,
+                    )
+                )
+
+            elif tag.endswith("}tbl"):
+                # 顶层表格
+                if tbl_index >= len(doc.tables):
+                    continue
+                tbl = doc.tables[tbl_index]
+                tbl_index += 1
+
+                table_index += 1
+                rows = self._extract_table_rows(tbl)
+                if not rows:
+                    continue
+
+                column_names = self._detect_header(rows)
+                # 数据行起点：表头存在时跳过首行
+                start_row = 1 if column_names is not None else 0
+
+                emitted_rows = 0
+                for row_idx, row_cells in enumerate(rows):
+                    if row_idx < start_row:
+                        continue  # 跳过表头行
+                    line = self._format_table_row(row_cells, column_names)
+                    cleaned_line = _clean_text(line)
+                    if not cleaned_line:
+                        stats["table_empty_row_dropped"] += 1
+                        stats["table_empty_row_chars"] += sum(
+                            len(c) for c in row_cells
+                        )
+                        continue
+                    block_index += 1
+                    sections.append(
+                        RawDocumentSection(
+                            content=cleaned_line,
+                            source_name=path.name,
+                            heading=current_heading,
+                            metadata={
+                                "table_index": table_index,
+                                "table_total_rows": len(rows),
+                            },
+                            block_type=BLOCK_TYPE_TABLE,
+                            block_index=block_index,
+                            table_index=table_index,
+                            row_start=row_idx,
+                            row_end=row_idx,
+                            column_names=list(column_names) if column_names else None,
+                        )
+                    )
+                    emitted_rows += 1
+
+                if emitted_rows == 0:
+                    # 整张表只有表头或全部空行 → 回退 block_index
+                    block_index -= 1
+                    table_index -= 1
+
+            elif tag.endswith("}txbxContent"):
+                # 顶层文本框（罕见；多数 txbxContent 嵌在 paragraph/table 内）
+                tx_text = _extract_textbox_text(child)
+                if not tx_text:
+                    stats["textbox_empty_dropped"] += 1
+                    continue
+                block_index += 1
+                sections.append(
+                    RawDocumentSection(
+                        content=tx_text,
+                        source_name=path.name,
+                        heading=current_heading,
+                        block_type=BLOCK_TYPE_TEXTBOX,
+                        block_index=block_index,
+                    )
+                )
+
+        self.last_filter_stats = stats
         if not sections:
             raise EmptyDocumentError(
                 f"DOCX 解析后无有效段落：{path.name}"
             )
         return sections
+
+    # ------------------------------------------------------------------
+    # 表格解析辅助
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_table_rows(tbl) -> list[list[str]]:
+        """从 python-docx Table 抽取每行每格的纯文本。
+
+        处理合并单元格：
+        - ``vMerge=continue``：取上方单元格的文本（不重复输出）。
+        - ``gridSpan``：python-docx 已按列展开；通过 ``_tc`` 句柄去重。
+        """
+        rows_text: list[list[str]] = []
+        # 用于 vMerge continue：记录上一行每列的文本
+        prev_row_cells: list[str] = []
+
+        for row in tbl.rows:
+            row_cells: list[str] = []
+            current_prev: list[str] = []
+
+            # 通过 _tc 句柄去重（python-docx 对合并单元格的视觉展开）
+            seen_tc_ids: set[int] = set()
+
+            for cell in row.cells:
+                tc = cell._tc
+                tc_id = id(tc)
+                if tc_id in seen_tc_ids:
+                    continue  # 同一 tc 已被展开，跳过
+                seen_tc_ids.add(tc_id)
+
+                tc_text = cell.text or ""
+                cleaned = _clean_text(tc_text)
+
+                # 检测 vMerge
+                vm = tc.find(
+                    ".//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}vMerge"
+                )
+                if vm is not None:
+                    val = vm.get(
+                        "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val",
+                        "continue",
+                    )
+                    if val == "continue":
+                        # 续行：使用上方单元格的文本
+                        col_idx = len(row_cells)
+                        prev_text = (
+                            prev_row_cells[col_idx]
+                            if col_idx < len(prev_row_cells)
+                            else ""
+                        )
+                        row_cells.append(prev_text)
+                        current_prev.append(prev_text)
+                        continue
+
+                row_cells.append(cleaned)
+                current_prev.append(cleaned)
+
+            rows_text.append(row_cells)
+            prev_row_cells = current_prev
+
+        return rows_text
+
+    @staticmethod
+    def _detect_header(rows: list[list[str]]) -> Optional[list[str]]:
+        """检测表头（保守启发式）。
+
+        满足全部条件才视为表头：
+        - 至少 2 行（表头 + 数据）
+        - 首行各单元格非空
+        - 首行单格 ≤ 30 字符
+        - 首行不含句子终止标点
+        """
+        if len(rows) < DocxParser._MIN_TABLE_ROWS_FOR_HEADER:
+            return None
+        first = rows[0]
+        if not first:
+            return None
+        if any(not (c and c.strip()) for c in first):
+            return None
+        if any(len(c.strip()) > DocxParser._MAX_HEADER_CELL_LEN for c in first):
+            return None
+        if any(re.search(r"[。？！.!?;；]", c) for c in first):
+            return None
+        return [c.strip() for c in first]
+
+    @staticmethod
+    def _format_table_row(cells: list[str], column_names: Optional[list[str]]) -> str:
+        """将一行单元格格式化为 ``列名: 值; 列名: 值`` 字符串。
+
+        无表头时使用 ``第N列: 值``。
+        """
+        parts: list[str] = []
+        for idx, cell in enumerate(cells):
+            value = (cell or "").strip()
+            if not value:
+                continue
+            if column_names and idx < len(column_names):
+                key = column_names[idx]
+                parts.append(f"{key}: {value}")
+            else:
+                parts.append(f"第{idx + 1}列: {value}")
+        return "; ".join(parts)
 
     # ------------------------------------------------------------------
     # 标题识别
@@ -464,6 +718,22 @@ def _clean_text(text: str) -> str:
     s = _MULTI_SPACE.sub(" ", text)
     s = _MULTI_NEWLINE.sub("\n\n", s)
     return s.strip()
+
+
+def _extract_textbox_text(elem) -> str:
+    """从 OOXML ``w:txbxContent`` 元素抽取所有文本。
+
+    合并内部连续段落（用 ``\\n`` 连接）。
+    """
+    if elem is None:
+        return ""
+    W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    paragraphs = []
+    for p in elem.iter(f"{W}p"):
+        text = "".join(t.text or "" for t in p.iter(f"{W}t"))
+        if text.strip():
+            paragraphs.append(text.strip())
+    return "\n".join(paragraphs)
 
 
 # ======================================================================

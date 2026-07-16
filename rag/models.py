@@ -58,6 +58,32 @@ class DocumentChunk(BaseModel):
     heading: Optional[str] = Field(None, description="标题（DOCX / MD）")
     line_start: Optional[int] = Field(None, description="起始行号（MD / TXT）")
     line_end: Optional[int] = Field(None, description="结束行号（MD / TXT）")
+    # ---- DOCX 块类型 / 表格元数据 ----
+    block_type: Optional[str] = Field(
+        None,
+        description="DOCX 块类型：paragraph / table / textbox；其他格式为 None",
+    )
+    block_indices: list[int] = Field(
+        default_factory=list,
+        description="聚合的所有原始块序号（DOCX 专用，block_index 列表）",
+    )
+    table_index: Optional[int] = Field(
+        None, description="DOCX 表格块所属表格序号（从 0 开始）"
+    )
+    table_indices: list[int] = Field(
+        default_factory=list,
+        description="聚合包含的所有表格序号（DOCX 专用；用于跨多表合并场景）",
+    )
+    row_start: Optional[int] = Field(
+        None, description="DOCX 表格块起始表格行号（从 0 开始）"
+    )
+    row_end: Optional[int] = Field(
+        None, description="DOCX 表格块结束表格行号（从 0 开始）"
+    )
+    column_names: Optional[list[str]] = Field(
+        None,
+        description="DOCX 表格块使用的列名列表（无可靠表头时为 None）",
+    )
     chunk_index: int = Field(..., ge=0, description="在所属文档中的片段序号")
     metadata: dict[str, Any] = Field(default_factory=dict, description="附加元数据")
 

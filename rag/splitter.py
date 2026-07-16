@@ -34,7 +34,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from config.settings import get_settings
 from rag.models import DocumentChunk
-from rag.parsers import RawDocumentSection
+from rag.parsers import BLOCK_TYPE_TABLE, RawDocumentSection
 
 
 # 中文优先分隔符列表（顺序敏感：优先级从高到低）
@@ -144,24 +144,47 @@ def _group_by_heading(
 ) -> list[tuple[Optional[str], list[RawDocumentSection]]]:
     """按 heading 分组；heading 为 ``None`` 的段落归入 ``(None, [...])`` 组。
 
-    当 heading 变化时开启新组；同一 heading 的连续段落聚合到同一组。
+    分组规则：
+    - heading 变化时开启新组
+    - 同一 heading 下，**遇到新表格**也开启新组（不同表格之间不直接合并）
+    - 段落 / 文本框之间不强制切分（由后续累积函数控制）
+
+    段落号 / block_index / table_index 都会被记录到 chunk 元数据。
     """
     groups: list[tuple[Optional[str], list[RawDocumentSection]]] = []
     current_heading: Optional[str] = None
+    current_table_index: Optional[int] = None
     current_group: list[RawDocumentSection] = []
 
+    def _flush() -> None:
+        nonlocal current_group
+        if current_group:
+            groups.append((current_heading, current_group))
+        current_group = []
+
     for sec in sections:
-        # 第一次出现 heading 才开启新组；否则合并到当前组
+        # 切换 heading → 新组
         if sec.heading != current_heading:
-            if current_group:
-                groups.append((current_heading, current_group))
+            _flush()
             current_heading = sec.heading
-            current_group = [sec]
+            current_table_index = None  # 重置表格序号追踪
+
+        # 表格块：相同 table_index 才允许合并到当前组；否则新组
+        if sec.block_type == BLOCK_TYPE_TABLE:
+            if current_table_index is not None and sec.table_index == current_table_index:
+                # 同一张表的连续行 → 追加
+                current_group.append(sec)
+            else:
+                # 新表或首张表 → 切到新组
+                if current_group and current_table_index != sec.table_index:
+                    _flush()
+                current_group.append(sec)
+                current_table_index = sec.table_index
         else:
+            # 段落 / 文本框：默认合并到当前组
             current_group.append(sec)
 
-    if current_group:
-        groups.append((current_heading, current_group))
+    _flush()
     return groups
 
 
@@ -320,7 +343,32 @@ def _make_chunk(
     line_ends = [s.line_end for s in source_secs if s.line_end is not None]
     page_nums = [s.page_number for s in source_secs if s.page_number is not None]
 
-    # 元数据：保留首个 section 的非空元数据
+    # DOCX 扩展元数据
+    block_indices: list[int] = []
+    block_type: Optional[str] = None
+    table_indices: list[int] = []
+    row_starts: list[int] = []
+    row_ends: list[int] = []
+    column_names: Optional[list[str]] = None
+    for s in source_secs:
+        if s.block_index is not None:
+            block_indices.append(s.block_index)
+        # 表格块 → 记录表格序号 / 行范围
+        if s.block_type == BLOCK_TYPE_TABLE:
+            block_type = BLOCK_TYPE_TABLE
+            if s.table_index is not None:
+                table_indices.append(s.table_index)
+            if s.row_start is not None:
+                row_starts.append(s.row_start)
+            if s.row_end is not None:
+                row_ends.append(s.row_end)
+            if s.column_names is not None and column_names is None:
+                column_names = list(s.column_names)
+        elif s.block_type is not None and block_type is None:
+            block_type = s.block_type
+
+    # 元数据：保留首个 section 的非空元数据（_attach_short_paragraphs
+    # 已把被合并短段号写入 metadata["merged_from"]）；不覆盖它。
     meta: dict = {}
     for s in source_secs:
         if s.metadata:
@@ -340,6 +388,13 @@ def _make_chunk(
         heading=heading,
         line_start=line_starts[0] if line_starts else None,
         line_end=line_ends[-1] if line_ends else None,
+        block_type=block_type,
+        block_indices=block_indices,
+        table_index=table_indices[0] if table_indices else None,
+        table_indices=sorted(set(table_indices)),
+        row_start=row_starts[0] if row_starts else None,
+        row_end=row_ends[-1] if row_ends else None,
+        column_names=column_names,
         chunk_index=chunk_index,
         metadata=meta,
     )
