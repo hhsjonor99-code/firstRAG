@@ -109,3 +109,55 @@ class ChatMessage(BaseModel):
         default_factory=list, description="assistant 消息附带的引用"
     )
     created_at: datetime = Field(..., description="消息创建时间")
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="附加元数据（如 standalone_query / retrieval_count / illegal_citations）",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 流式事件
+# ---------------------------------------------------------------------------
+# ChatStreamEvent.event_type 的合法值
+CHAT_EVENT_REWRITE = "rewrite"        # 改写后的问题（可选）
+CHAT_EVENT_SOURCES = "sources"        # 检索结果：citations 已就绪
+CHAT_EVENT_TOKEN = "token"            # LLM 增量输出（已 sanitize reasoning）
+CHAT_EVENT_DONE = "done"              # 流式结束：包含最终 ChatMessage
+CHAT_EVENT_ERROR = "error"            # 中途异常：携带异常类型 / 消息
+
+
+class ChatStreamEvent(BaseModel):
+    """ChatService 流式事件。
+
+    事件顺序约定（典型流程）：
+
+    1. ``rewrite`` —— 当问题被改写时；``content`` 为改写后的问题。
+    2. ``sources`` —— 检索完成；``citations`` 携带 :class:`RetrievedChunk` 列表。
+    3. ``token`` —— 每段增量输出；``content`` 为单段文本。
+    4. ``done`` —— 流式结束；``message`` 携带最终 :class:`ChatMessage`。
+
+    异常场景：
+
+    - ``error`` —— 中途发生不可恢复错误；流式迭代器随后终止。
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    event_type: str = Field(
+        ...,
+        description=(
+            "事件类型：rewrite / sources / token / done / error"
+        ),
+    )
+    content: Optional[str] = Field(
+        None, description="token 文本 / rewrite 后问题 / 错误描述"
+    )
+    citations: list[RetrievedChunk] = Field(
+        default_factory=list, description="sources 事件的检索结果"
+    )
+    message: Optional[ChatMessage] = Field(
+        None, description="done 事件携带的最终 ChatMessage"
+    )
+    metadata: dict[str, Any] = Field(
+        default_factory=dict, description="附加元数据"
+    )
