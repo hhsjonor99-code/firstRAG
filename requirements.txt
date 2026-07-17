@@ -12,6 +12,8 @@ faiss-cpu
 langchain-text-splitters
 openai
 requests
+# httpx[socks] 兼容本地 SOCKS5 代理环境；openai SDK 底层依赖 httpx
+httpx[socks]
 tenacity
 python-dotenv
 pydantic

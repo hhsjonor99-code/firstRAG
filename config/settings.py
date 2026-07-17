@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     minimax_api_key: Optional[str] = None
     minimax_base_url: str = "https://api.minimaxi.com/v1"
     minimax_model: str = "MiniMax-M3"
+    minimax_timeout: float = 60.0
+    minimax_max_retries: int = 2
+    minimax_temperature: float = 0.2
+    minimax_max_tokens: Optional[int] = None
 
     # ----- 切分 / 检索 -----
     chunk_size: int = 800
