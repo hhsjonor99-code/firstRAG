@@ -48,3 +48,5 @@ storage/metadata/*
 # 日志
 *.log
 logs/
+.agents/
+.claude/skills/

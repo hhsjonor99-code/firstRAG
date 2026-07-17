@@ -26,7 +26,7 @@ import numpy as np
 from config.settings import Settings
 from rag.embedding_provider import EmbeddingError
 from rag.llm_client import LLMError
-from rag.models import DocumentChunk, RetrievedChunk
+from rag.models import ChatMessage, ChatStreamEvent, DocumentChunk, RetrievedChunk
 
 
 # ---------------------------------------------------------------------------
@@ -240,3 +240,56 @@ def make_chunk(
         chunk_index=0,
     )
     return RetrievedChunk(chunk=chunk, score=score, citation_id=citation_id)
+
+
+# ---------------------------------------------------------------------------
+# FakeChatService
+# ---------------------------------------------------------------------------
+class FakeChatService:
+    """满足 :class:`rag.chat_service.ChatService.stream` 协议的假服务。
+
+    用于 UI 控制器的回归测试。**不**调用任何远程 API。
+
+    :param events: 预设的 :class:`ChatStreamEvent` 序列；将按顺序 yield。
+    :param raise_on_stream: 若提供，则 ``stream()`` 立即抛出该异常，
+        不会 yield 任何事件。
+    :param final_message: 若提供，会被记录到 ``last_final_message``，
+        便于测试在 controller 之外校验。
+    """
+
+    def __init__(
+        self,
+        events: Optional[list[ChatStreamEvent]] = None,
+        raise_on_stream: Optional[BaseException] = None,
+        final_message: Optional[ChatMessage] = None,
+    ) -> None:
+        self._events: list[ChatStreamEvent] = list(events) if events else []
+        self._raise = raise_on_stream
+        self._final_message = final_message
+        self.call_count = 0
+        self.last_query: Optional[str] = None
+        self.last_history: Optional[list[ChatMessage]] = None
+
+    def stream(
+        self,
+        query: str,
+        history: Optional[list[ChatMessage]] = None,
+    ) -> Iterator[ChatStreamEvent]:
+        self.call_count += 1
+        self.last_query = query
+        self.last_history = list(history) if history else []
+        if self._raise is not None:
+            raise self._raise
+        for ev in self._events:
+            yield ev
+
+    # 为兼容旧接口保留 ``ask``。
+    def ask(
+        self,
+        query: str,
+        history: Optional[list[ChatMessage]] = None,
+    ) -> ChatMessage:
+        for ev in self.stream(query, history=history):
+            if getattr(ev, "message", None) is not None:
+                return ev.message  # type: ignore[return-value]
+        raise LLMError("FakeChatService.ask: stream 未产出 done 事件。")
