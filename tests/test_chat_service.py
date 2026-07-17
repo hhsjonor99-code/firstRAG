@@ -119,12 +119,14 @@ def test_ask_no_history_single_turn(
     msg = svc.ask("什么是高血压？")
     assert msg.role == "assistant"
     assert "高血压" in msg.content
-    # citations 来自 retriever
-    assert len(msg.citations) == 2
-    assert {c.citation_id for c in msg.citations} == {"S1", "S2"}
-    # metadata
+    # citations 只来自答案中实际引用的 [S1]
+    assert len(msg.citations) == 1
+    assert {c.citation_id for c in msg.citations} == {"S1"}
+    # metadata 仍记录候选
     assert msg.metadata.get("retrieval_count") == 2
     assert msg.metadata.get("standalone_query") == "什么是高血压？"
+    assert msg.metadata.get("candidate_citation_ids") == ["S1", "S2"]
+    assert msg.metadata.get("used_citation_ids") == ["S1"]
     # 检索被调用一次
     assert retriever.call_count == 1
 
@@ -353,8 +355,8 @@ def test_history_answer_not_used_as_source(
     # content 只来自 [S1]，不应含历史文本
     assert "历史回答" not in msg.content
     assert "旧信息" not in msg.content
-    # citations 完全来自 retriever
-    assert msg.citations == sample_retrieved
+    # citations 只包含答案中实际引用的 [S1]
+    assert {c.citation_id for c in msg.citations} == {"S1"}
 
 
 # ---------------------------------------------------------------------------
@@ -439,7 +441,8 @@ def test_stream_done_contains_final_message(
     assert done.message is not None
     assert done.message.role == "assistant"
     assert done.message.content == "A [S1]."
-    assert done.message.citations == sample_retrieved
+    # done.citations 只含答案中实际使用的 [S1]
+    assert {c.citation_id for c in done.message.citations} == {"S1"}
     assert "S1" in done.message.content
 
 
@@ -588,3 +591,258 @@ def test_stream_rewrite_event(settings: Settings, sample_retrieved: list[Retriev
     rewrites = [e for e in events if e.event_type == CHAT_EVENT_REWRITE]
     assert len(rewrites) == 1
     assert rewrites[0].content == "改写后的问题"
+
+
+# ===========================================================================
+# 7.2 引用一致性：最终 citations 只含答案中实际出现的 [S#]
+# ===========================================================================
+def _build_retrieved_3() -> list[RetrievedChunk]:
+    return _build_retrieved([
+        ("c1", "d1", "高血压是慢性病。", 0.95, "S1"),
+        ("c2", "d1", "高血压需监测血压。", 0.88, "S2"),
+        ("c3", "d1", "高血压可引发中风。", 0.80, "S3"),
+    ])
+
+
+# ---------------------------------------------------------------------------
+# 1. 候选 S1/S2，答案只引用 [S1] → 最终 citations 只含 S1
+# ---------------------------------------------------------------------------
+def test_citations_filter_only_used(settings: Settings):
+    retrieved = _build_retrieved_3()
+    retriever = FakeRetriever(retrieved)
+    llm = FakeLLMClient(default_response="高血压是慢性病 [S1].")
+    pb = PromptBuilder(settings)
+    svc = ChatService(retriever, pb, llm, settings)
+
+    msg = svc.ask("高血压?")
+    assert {c.citation_id for c in msg.citations} == {"S1"}
+    assert msg.metadata.get("candidate_citation_ids") == ["S1", "S2", "S3"]
+    assert msg.metadata.get("used_citation_ids") == ["S1"]
+
+
+# ---------------------------------------------------------------------------
+# 2. 答案只引用 [S2] → citations 只含 S2
+# ---------------------------------------------------------------------------
+def test_citations_filter_only_s2(settings: Settings):
+    retrieved = _build_retrieved_3()
+    retriever = FakeRetriever(retrieved)
+    llm = FakeLLMClient(default_response="高血压需监测 [S2].")
+    pb = PromptBuilder(settings)
+    svc = ChatService(retriever, pb, llm, settings)
+
+    msg = svc.ask("高血压?")
+    assert {c.citation_id for c in msg.citations} == {"S2"}
+
+
+# ---------------------------------------------------------------------------
+# 3. 答案引用顺序 [S2] 后 [S1] → citations 顺序为 S2、S1
+# ---------------------------------------------------------------------------
+def test_citations_preserve_answer_order(settings: Settings):
+    retrieved = _build_retrieved_3()
+    retriever = FakeRetriever(retrieved)
+    llm = FakeLLMClient(default_response="监测 [S2] 然后 [S1].")
+    pb = PromptBuilder(settings)
+    svc = ChatService(retriever, pb, llm, settings)
+
+    msg = svc.ask("高血压?")
+    ids = [c.citation_id for c in msg.citations]
+    assert ids == ["S2", "S1"]
+
+
+# ---------------------------------------------------------------------------
+# 4. 重复引用 [S1][S1] 只保留一次
+# ---------------------------------------------------------------------------
+def test_citations_dedupe(settings: Settings):
+    retrieved = _build_retrieved_3()
+    retriever = FakeRetriever(retrieved)
+    llm = FakeLLMClient(default_response="高血压 [S1] 又 [S1] 又 [S1].")
+    pb = PromptBuilder(settings)
+    svc = ChatService(retriever, pb, llm, settings)
+
+    msg = svc.ask("高血压?")
+    assert {c.citation_id for c in msg.citations} == {"S1"}
+    assert len(msg.citations) == 1
+
+
+# ---------------------------------------------------------------------------
+# 5. 答案含非法 [S99]  → 过滤后不进入 citations
+# ---------------------------------------------------------------------------
+def test_illegal_citation_not_in_final_citations(settings: Settings):
+    retrieved = _build_retrieved_3()
+    retriever = FakeRetriever(retrieved)
+    llm = FakeLLMClient(default_response="高血压 [S1] 引用 [S99].")
+    pb = PromptBuilder(settings)
+    svc = ChatService(retriever, pb, llm, settings)
+
+    msg = svc.ask("高血压?")
+    # [S99] 被移除；最终 citations 只含 S1
+    assert {c.citation_id for c in msg.citations} == {"S1"}
+    assert "S99" in msg.metadata.get("illegal_citations", [])
+
+
+# ---------------------------------------------------------------------------
+# 6. 答案无任何引用 → citations 空 + citation_warning
+# ---------------------------------------------------------------------------
+def test_no_citation_in_answer_sets_warning(settings: Settings):
+    retrieved = _build_retrieved_3()
+    retriever = FakeRetriever(retrieved)
+    llm = FakeLLMClient(default_response="高血压是慢性病。")
+    pb = PromptBuilder(settings)
+    svc = ChatService(retriever, pb, llm, settings)
+
+    msg = svc.ask("高血压?")
+    assert msg.citations == []
+    assert msg.metadata.get("citation_warning") == "answer_has_no_citation_reference"
+    # candidate 仍保留
+    assert msg.metadata.get("candidate_citation_ids") == ["S1", "S2", "S3"]
+
+
+# ---------------------------------------------------------------------------
+# 7. 固定拒答语 → citations 始终为空
+# ---------------------------------------------------------------------------
+def test_fixed_refusal_citations_empty(settings: Settings):
+    from rag.prompt_builder import NO_EVIDENCE_REPLY
+    retriever = FakeRetriever(_build_retrieved_3())
+    # LLM 试图说点东西，但 retriever 返回 0（触发固定拒答）
+    retriever2 = FakeRetriever(results=[])
+    llm = FakeLLMClient(default_response="不可能被调用")
+    pb = PromptBuilder(settings)
+    svc = ChatService(retriever2, pb, llm, settings)
+
+    msg = svc.ask("Q?")
+    assert msg.content == NO_EVIDENCE_REPLY
+    assert msg.citations == []
+    # candidate 留空（因为是空检索）
+    assert msg.metadata.get("candidate_citation_ids") == []
+
+
+# ---------------------------------------------------------------------------
+# 7b. 检索非空但 LLM 返回固定拒答语（极端场景）→ citations 仍空
+# ---------------------------------------------------------------------------
+def test_refusal_text_with_candidates_citations_empty(settings: Settings):
+    from rag.prompt_builder import NO_EVIDENCE_REPLY
+    retrieved = _build_retrieved_3()
+    retriever = FakeRetriever(retrieved)
+    # LLM 仍按 prompt 返回拒答
+    llm = FakeLLMClient(default_response=NO_EVIDENCE_REPLY)
+    pb = PromptBuilder(settings)
+    svc = ChatService(retriever, pb, llm, settings)
+
+    msg = svc.ask("Q?")
+    assert msg.content == NO_EVIDENCE_REPLY
+    assert msg.citations == []
+    # candidate 仍记录
+    assert msg.metadata.get("candidate_citation_ids") == ["S1", "S2", "S3"]
+
+
+# ---------------------------------------------------------------------------
+# 8. 空检索拒答 citations 空
+# ---------------------------------------------------------------------------
+def test_empty_retrieval_citations_empty(settings: Settings):
+    from rag.prompt_builder import NO_EVIDENCE_REPLY
+    retriever = FakeRetriever(results=[])
+    llm = FakeLLMClient()
+    pb = PromptBuilder(settings)
+    svc = ChatService(retriever, pb, llm, settings)
+
+    msg = svc.ask("Q?")
+    assert msg.content == NO_EVIDENCE_REPLY
+    assert msg.citations == []
+
+
+# ---------------------------------------------------------------------------
+# 9. 流式 done 事件只含实际使用的引用
+# ---------------------------------------------------------------------------
+def test_stream_done_citations_filtered(settings: Settings):
+    retrieved = _build_retrieved_3()
+    retriever = FakeRetriever(retrieved)
+    llm = StreamingFakeLLMClient(stream_chunks=["高血压 [S2] 监测"])
+    pb = PromptBuilder(settings)
+    svc = ChatService(retriever, pb, llm, settings)
+
+    events = list(svc.stream("Q?"))
+    done = [e for e in events if e.event_type == CHAT_EVENT_DONE][0]
+    assert {c.citation_id for c in done.message.citations} == {"S2"}
+
+
+# ---------------------------------------------------------------------------
+# 10. 流式拒答 done.citations 为空
+# ---------------------------------------------------------------------------
+def test_stream_refusal_done_citations_empty(settings: Settings):
+    from rag.prompt_builder import NO_EVIDENCE_REPLY
+    retriever = FakeRetriever(results=[])
+    llm = StreamingFakeLLMClient(stream_chunks=[])  # 不会被调用
+    pb = PromptBuilder(settings)
+    svc = ChatService(retriever, pb, llm, settings)
+
+    events = list(svc.stream("Q?"))
+    done = [e for e in events if e.event_type == CHAT_EVENT_DONE][0]
+    assert done.message.content == NO_EVIDENCE_REPLY
+    assert done.message.citations == []
+
+
+# ---------------------------------------------------------------------------
+# 11. sources 候选事件不影响最终 citations
+# ---------------------------------------------------------------------------
+def test_sources_event_has_candidates_done_has_filtered(settings: Settings):
+    retrieved = _build_retrieved_3()
+    retriever = FakeRetriever(retrieved)
+    llm = StreamingFakeLLMClient(stream_chunks=["只引用 [S1]."])
+    pb = PromptBuilder(settings)
+    svc = ChatService(retriever, pb, llm, settings)
+
+    events = list(svc.stream("Q?"))
+    sources = [e for e in events if e.event_type == CHAT_EVENT_SOURCES][0]
+    done = [e for e in events if e.event_type == CHAT_EVENT_DONE][0]
+    # sources 带全部候选
+    assert {c.citation_id for c in sources.citations} == {"S1", "S2", "S3"}
+    # done 只含实际引用的
+    assert {c.citation_id for c in done.message.citations} == {"S1"}
+
+
+# ---------------------------------------------------------------------------
+# 12. [S10] 不误匹配 [S1]
+# ---------------------------------------------------------------------------
+def test_s10_not_matched_as_s1(settings: Settings):
+    # 构造含 S1 与 S10 的候选
+    retrieved = _build_retrieved([
+        ("c1", "d1", "短文", 0.95, "S1"),
+        ("c10", "d1", "长文", 0.80, "S10"),
+    ])
+    retriever = FakeRetriever(retrieved)
+    llm = FakeLLMClient(default_response="参见 [S10].")
+    pb = PromptBuilder(settings)
+    svc = ChatService(retriever, pb, llm, settings)
+
+    msg = svc.ask("Q?")
+    # 最终 citations 应只含 S10
+    assert {c.citation_id for c in msg.citations} == {"S10"}
+
+
+# ---------------------------------------------------------------------------
+# 13. PromptBuilder.select_cited_chunks 直接测试
+# ---------------------------------------------------------------------------
+def test_select_cited_chunks_direct(settings: Settings):
+    pb = PromptBuilder(settings)
+    retrieved = _build_retrieved_3()
+    # 只引 S2
+    out = pb.select_cited_chunks("引用 [S2].", retrieved)
+    assert [c.citation_id for c in out] == ["S2"]
+    # 引用顺序 [S3] 后 [S1]
+    out2 = pb.select_cited_chunks("[S3] and [S1]", retrieved)
+    assert [c.citation_id for c in out2] == ["S3", "S1"]
+    # 重复 [S1][S1]
+    out3 = pb.select_cited_chunks("[S1] [S1]", retrieved)
+    assert [c.citation_id for c in out3] == ["S1"]
+    # [S10] 不会匹配成 S1
+    out4 = pb.select_cited_chunks("[S10]", retrieved)
+    assert out4 == []
+    # 固定拒答语
+    out5 = pb.select_cited_chunks(NO_EVIDENCE_REPLY, retrieved)
+    assert out5 == []
+    # 空字符串
+    out6 = pb.select_cited_chunks("", retrieved)
+    assert out6 == []
+    # 不修改原 RetrievedChunk
+    out7 = pb.select_cited_chunks("[S1]", retrieved)
+    assert out7[0] is retrieved[0]

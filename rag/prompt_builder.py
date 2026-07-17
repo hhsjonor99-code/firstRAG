@@ -33,6 +33,9 @@ _CITATION_RE = re.compile(r"\[S(\d+)\]")
 # 用于在 system prompt 中提示「非引用」格式的误识别（不应被处理）
 # 仅识别 [S#]；不识别 S1 / 【S1】 / [Sabc]
 
+# 固定拒答语
+NO_EVIDENCE_REPLY = "当前知识库中没有找到足够依据。"
+
 ANSWER_SYSTEM_PROMPT_ZH = """你是 firstRAG 本地知识库问答助手。请严格遵守以下规则：
 
 1. 你**只能**依据下方 <source id="S#"> 片段中提供的内容回答用户问题。
@@ -308,6 +311,46 @@ class PromptBuilder:
 
         cleaned = _CITATION_RE.sub(_replace, answer)
         return cleaned, illegal_set
+
+    def select_cited_chunks(
+        self,
+        answer: str,
+        retrieved_chunks: list[RetrievedChunk],
+    ) -> list[RetrievedChunk]:
+        """从候选 ``retrieved_chunks`` 中筛选**最终答案中实际引用**的来源。
+
+        规则：
+
+        1. 若 ``answer`` 为空 / 非字符串，返回空列表。
+        2. 若 ``answer`` 等于固定拒答语 :data:`NO_EVIDENCE_REPLY`，
+           始终返回空列表（即使候选非空）。
+        3. 调用 :meth:`extract_citation_ids` 提取答案中按出现顺序的合法编号。
+        4. 同一编号只保留首次出现；按答案中的首次出现顺序排列。
+        5. ``[S10]`` 不会被误匹配成 ``[S1]``（沿用 ``_CITATION_RE``）。
+        6. 不修改任何 :class:`RetrievedChunk` 对象（按引用返回原对象）。
+        7. 候选中未出现的编号不会出现在结果中（即便它们合法）。
+        """
+        if not isinstance(answer, str) or not answer:
+            return []
+        if answer.strip() == NO_EVIDENCE_REPLY:
+            return []
+        # 建立 citation_id -> RetrievedChunk 映射（候选可能含重复 id，去重）
+        by_id: dict[str, RetrievedChunk] = {}
+        for rc in retrieved_chunks:
+            cid = rc.citation_id
+            if cid and cid not in by_id:
+                by_id[cid] = rc
+        # 按答案中首次出现顺序返回
+        out: list[RetrievedChunk] = []
+        seen: set[str] = set()
+        for cid in self.extract_citation_ids(answer):
+            if cid in seen:
+                continue
+            seen.add(cid)
+            rc = by_id.get(cid)
+            if rc is not None:
+                out.append(rc)
+        return out
 
     # ------------------------------------------------------------------
     # 内部：历史裁剪 / 格式化

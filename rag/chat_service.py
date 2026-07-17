@@ -56,11 +56,8 @@ from .models import (
     ChatStreamEvent,
     RetrievedChunk,
 )
-from .prompt_builder import PromptBuilder
+from .prompt_builder import NO_EVIDENCE_REPLY, PromptBuilder
 from .retriever import Retriever, RetrieverError
-
-# 固定拒答语（与 PromptBuilder 中的固定话术保持一致）
-NO_EVIDENCE_REPLY = "当前知识库中没有找到足够依据。"
 
 # 改写结果的合理性保护
 _REWRITE_REJECT_TOO_LONG = 600
@@ -175,17 +172,20 @@ class ChatService:
 
         1. 校验 query。
         2. 改写（无历史时直接用原 query）。
-        3. 检索。
-        4. 无结果 → 固定拒答。
+        3. 检索候选片段。
+        4. 无结果 → 固定拒答（citations 为空）。
         5. 有结果 → 拼 Prompt → 调 LLM → 清理非法引用。
-        6. 构造 ChatMessage（含 citations、metadata）。
+        6. **从最终答案筛选 citations**（只保留答案中实际出现的 [S#]）。
+        7. 构造 ChatMessage（citations = 筛选后的最终引用）。
         """
         clean_query = self._validate_query(query)
         history_list = list(history) if history else []
         standalone_query = self.rewrite_query(clean_query, history_list)
         retrieved = self._retrieve(standalone_query)
         if not retrieved:
-            return self._make_no_evidence_message(clean_query, standalone_query)
+            return self._make_no_evidence_message(
+                clean_query, standalone_query, retrieved=[]
+            )
         return self._generate_answer(
             user_query=clean_query,
             standalone_query=standalone_query,
@@ -235,13 +235,15 @@ class ChatService:
             raise ChatGenerationError(
                 f"检索失败：{type(exc).__name__}。"
             ) from exc
-        # 3. sources 事件
+        # 3. sources 事件（候选检索结果，仅供前端展示"检索进行中"；
+        #    最终引用以 done.message.citations 为准）
         yield ChatStreamEvent(
             event_type=CHAT_EVENT_SOURCES,
             citations=list(retrieved),
             metadata={
                 "retrieval_count": len(retrieved),
                 "standalone_query": standalone_query,
+                "candidate_only": True,
             },
         )
 
@@ -251,7 +253,9 @@ class ChatService:
                 event_type=CHAT_EVENT_TOKEN,
                 content=NO_EVIDENCE_REPLY,
             )
-            final_msg = self._make_no_evidence_message(clean_query, standalone_query)
+            final_msg = self._make_no_evidence_message(
+                clean_query, standalone_query, retrieved=[]
+            )
             yield ChatStreamEvent(
                 event_type=CHAT_EVENT_DONE,
                 message=final_msg,
@@ -282,7 +286,7 @@ class ChatService:
                 f"LLM 流式调用失败（未预期异常）：{type(exc).__name__}。"
             ) from exc
 
-        # 6. 流结束：清理非法引用，构造最终 ChatMessage
+        # 6. 流结束：清理非法引用 → 筛选最终 citations → 构造最终 ChatMessage
         raw_answer = "".join(accumulated)
         cleaned, illegal = self._prompt_builder.sanitize_invalid_citations(
             raw_answer, retrieved
@@ -295,12 +299,15 @@ class ChatService:
             self._log.warning(
                 "LLM 引用了未提供的编号：%s，已过滤。", illegal
             )
+        final_citations, citation_warning = self._filter_citations(cleaned, retrieved)
         final_msg = self._make_assistant_message(
             user_query=clean_query,
             standalone_query=standalone_query,
             retrieved=retrieved,
+            final_citations=final_citations,
             content=cleaned,
             illegal_citations=illegal,
+            citation_warning=citation_warning,
         )
         yield ChatStreamEvent(
             event_type=CHAT_EVENT_DONE,
@@ -366,32 +373,65 @@ class ChatService:
             self._log.warning(
                 "LLM 引用了未提供的编号：%s，已过滤。", illegal
             )
+        # 从最终答案筛选 citations
+        final_citations, citation_warning = self._filter_citations(cleaned, retrieved)
         return self._make_assistant_message(
             user_query=user_query,
             standalone_query=standalone_query,
             retrieved=retrieved,
+            final_citations=final_citations,
             content=cleaned,
             illegal_citations=illegal,
+            citation_warning=citation_warning,
         )
+
+    def _filter_citations(
+        self,
+        cleaned_answer: str,
+        retrieved: list[RetrievedChunk],
+    ) -> tuple[list[RetrievedChunk], Optional[str]]:
+        """从 cleaned_answer 中筛选最终 citations。
+
+        行为：
+
+        1. 使用 ``PromptBuilder.select_cited_chunks`` 按答案中的引用筛选。
+        2. 若 ``cleaned_answer`` 是固定拒答语 → citations 始终为空。
+        3. 若 cleaned_answer 中没有任何合法引用，但 retrieved 非空，
+           设置 ``citation_warning`` 用于上层提示，但**不**把候选
+           当作最终引用。
+        """
+        final_citations = self._prompt_builder.select_cited_chunks(
+            cleaned_answer, retrieved
+        )
+        if cleaned_answer.strip() == NO_EVIDENCE_REPLY:
+            return [], None
+        if not final_citations:
+            # 答案没有任何 [S#]，但又走完了 LLM → 警告
+            return [], "answer_has_no_citation_reference"
+        return final_citations, None
 
     def _make_assistant_message(
         self,
         user_query: str,
         standalone_query: str,
         retrieved: list[RetrievedChunk],
+        final_citations: list[RetrievedChunk],
         content: str,
         illegal_citations: Optional[list[str]] = None,
+        citation_warning: Optional[str] = None,
     ) -> ChatMessage:
         return ChatMessage(
             role="assistant",
             content=content,
-            citations=list(retrieved),
+            citations=list(final_citations),
             created_at=datetime.now(timezone.utc),
             metadata=self._build_metadata(
                 user_query=user_query,
                 standalone_query=standalone_query,
                 retrieved=retrieved,
+                final_citations=final_citations,
                 illegal_citations=illegal_citations,
+                citation_warning=citation_warning,
             ),
         )
 
@@ -399,7 +439,14 @@ class ChatService:
         self,
         user_query: str,
         standalone_query: str,
+        retrieved: Optional[list[RetrievedChunk]] = None,
     ) -> ChatMessage:
+        """构造固定拒答消息。
+
+        citations 始终为空；metadata 仍保留 candidate_citation_ids 与
+        retrieval_count（仅供调试 / 审计；UI 引用面板不展示）。
+        """
+        retrieved_list = list(retrieved) if retrieved else []
         return ChatMessage(
             role="assistant",
             content=NO_EVIDENCE_REPLY,
@@ -408,8 +455,10 @@ class ChatService:
             metadata=self._build_metadata(
                 user_query=user_query,
                 standalone_query=standalone_query,
-                retrieved=[],
+                retrieved=retrieved_list,
+                final_citations=[],
                 illegal_citations=None,
+                citation_warning=None,
             ),
         )
 
@@ -418,14 +467,22 @@ class ChatService:
         user_query: str,
         standalone_query: str,
         retrieved: list[RetrievedChunk],
-        illegal_citations: Optional[list[str]],
+        final_citations: list[RetrievedChunk],
+        illegal_citations: Optional[list[str]] = None,
+        citation_warning: Optional[str] = None,
     ) -> dict:
+        candidate_ids = [rc.citation_id for rc in retrieved if rc.citation_id]
+        used_ids = [rc.citation_id for rc in final_citations if rc.citation_id]
         meta: dict = {
             "standalone_query": standalone_query,
             "retrieval_count": len(retrieved),
+            "candidate_citation_ids": candidate_ids,
+            "used_citation_ids": used_ids,
         }
         if illegal_citations:
             meta["illegal_citations"] = list(illegal_citations)
+        if citation_warning:
+            meta["citation_warning"] = citation_warning
         return meta
 
 
