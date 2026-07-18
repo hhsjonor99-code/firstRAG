@@ -3,6 +3,7 @@
 本地文档知识库 RAG 系统。第一版基于 Streamlit 单体应用，支持 PDF / DOCX / TXT / Markdown 文档的上传、解析、Embedding、检索与多轮问答。
 
 完整开发计划见 [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md)。
+![Uploading _LRF}N`61]53~U5$~_9N0GK.png…]()
 
 ## 环境要求
 
