@@ -135,6 +135,8 @@ Streamlit = 给用户操作的网页
 | Git | 保存每阶段代码 |
 
 本项目不需要安装 PyTorch，因为模型运行在云端。
+<img width="2878" height="1460" alt="image" src="https://github.com/user-attachments/assets/a0a425a1-6849-46b2-82b6-a512c8b0f33b" />
+
 
 ---
 
